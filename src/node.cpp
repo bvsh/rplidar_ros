@@ -212,72 +212,85 @@ int main(int argc, char * argv[]) {
         return -2;
     }
 
-    // make connection...
-    if (IS_FAIL(drv->connect(serial_port.c_str(), (_u32)serial_baudrate))) {
-        ROS_ERROR("Error, cannot bind to the specified serial port %s.",serial_port.c_str());
-        RPlidarDriver::DisposeDriver(drv);
-        return -1;
-    }
+    bool ok;
+    do
+    {
+        ok = true;
+        // make connection...
+        if (IS_FAIL(drv->connect(serial_port.c_str(), (_u32)serial_baudrate))) {
+            ROS_ERROR("Error, cannot bind to the specified serial port %s.",serial_port.c_str());
+            RPlidarDriver::DisposeDriver(drv);
+            ok = false;
+        }
 
-    // get rplidar device info
-    if (!getRPLIDARDeviceInfo(drv)) {
-        return -1;
-    }
+        // get rplidar device info
+        if (ok && !getRPLIDARDeviceInfo(drv)) {
+            ok = false;
+        }
 
-    // check health...
-    if (!checkRPLIDARHealth(drv)) {
-        RPlidarDriver::DisposeDriver(drv);
-        return -1;
-    }
+        // check health...
+        if (ok && !checkRPLIDARHealth(drv)) {
+            RPlidarDriver::DisposeDriver(drv);
+            ok = false;
+        }
 
-    ros::ServiceServer stop_motor_service = nh.advertiseService("stop_motor", stop_motor);
-    ros::ServiceServer start_motor_service = nh.advertiseService("start_motor", start_motor);
+        if(ok)
+        {
+            ros::ServiceServer stop_motor_service = nh.advertiseService("stop_motor", stop_motor);
+            ros::ServiceServer start_motor_service = nh.advertiseService("start_motor", start_motor);
 
-    drv->startMotor();
+            drv->startMotor();
 
-    RplidarScanMode current_scan_mode;
-    if (scan_mode.empty()) {
-        op_result = drv->startScan(false /* not force scan */, true /* use typical scan mode */, 0, &current_scan_mode);
-    } else {
-        std::vector<RplidarScanMode> allSupportedScanModes;
-        op_result = drv->getAllSupportedScanModes(allSupportedScanModes);
+            RplidarScanMode current_scan_mode;
+            if (scan_mode.empty()) {
+                op_result = drv->startScan(false /* not force scan */, true /* use typical scan mode */, 0, &current_scan_mode);
+            } else {
+                std::vector<RplidarScanMode> allSupportedScanModes;
+                op_result = drv->getAllSupportedScanModes(allSupportedScanModes);
 
-        if (IS_OK(op_result)) {
-            _u16 selectedScanMode = _u16(-1);
-            for (std::vector<RplidarScanMode>::iterator iter = allSupportedScanModes.begin(); iter != allSupportedScanModes.end(); iter++) {
-                if (iter->scan_mode == scan_mode) {
-                    selectedScanMode = iter->id;
-                    break;
+                if (IS_OK(op_result)) {
+                    _u16 selectedScanMode = _u16(-1);
+                    for (std::vector<RplidarScanMode>::iterator iter = allSupportedScanModes.begin(); iter != allSupportedScanModes.end(); iter++) {
+                        if (iter->scan_mode == scan_mode) {
+                            selectedScanMode = iter->id;
+                            break;
+                        }
+                    }
+
+                    if (selectedScanMode == _u16(-1)) {
+                        ROS_ERROR("scan mode `%s' is not supported by lidar, supported modes:", scan_mode.c_str());
+                        for (std::vector<RplidarScanMode>::iterator iter = allSupportedScanModes.begin(); iter != allSupportedScanModes.end(); iter++) {
+                            ROS_ERROR("\t%s: max_distance: %.1f m, Point number: %.1fK",  iter->scan_mode,
+                                    iter->max_distance, (1000/iter->us_per_sample));
+                        }
+                        op_result = RESULT_OPERATION_FAIL;
+                        ok = false;
+                    } else {
+                        op_result = drv->startScanExpress(false /* not force scan */, selectedScanMode, 0, &current_scan_mode);
+                    }
                 }
             }
 
-            if (selectedScanMode == _u16(-1)) {
-                ROS_ERROR("scan mode `%s' is not supported by lidar, supported modes:", scan_mode.c_str());
-                for (std::vector<RplidarScanMode>::iterator iter = allSupportedScanModes.begin(); iter != allSupportedScanModes.end(); iter++) {
-                    ROS_ERROR("\t%s: max_distance: %.1f m, Point number: %.1fK",  iter->scan_mode,
-                            iter->max_distance, (1000/iter->us_per_sample));
-                }
-                op_result = RESULT_OPERATION_FAIL;
-            } else {
-                op_result = drv->startScanExpress(false /* not force scan */, selectedScanMode, 0, &current_scan_mode);
+            if(IS_OK(op_result))
+            {
+                //default frequent is 10 hz (by motor pwm value),  current_scan_mode.us_per_sample is the number of scan point per us
+                angle_compensate_multiple = (int)(1000*1000/current_scan_mode.us_per_sample/10.0/360.0);
+                if(angle_compensate_multiple < 1) 
+                angle_compensate_multiple = 1;
+                max_distance = current_scan_mode.max_distance;
+                ROS_INFO("current scan mode: %s, max_distance: %.1f m, Point number: %.1fK , angle_compensate: %d",  current_scan_mode.scan_mode,
+                        current_scan_mode.max_distance, (1000/current_scan_mode.us_per_sample), angle_compensate_multiple);
+            }
+            else
+            {
+                ROS_ERROR("Can not start scan: %08x!", op_result);
+                drv->stop();
+                drv->stopMotor();
+                RPlidarDriver::DisposeDriver(drv);
+                ok = false;
             }
         }
-    }
-
-    if(IS_OK(op_result))
-    {
-        //default frequent is 10 hz (by motor pwm value),  current_scan_mode.us_per_sample is the number of scan point per us
-        angle_compensate_multiple = (int)(1000*1000/current_scan_mode.us_per_sample/10.0/360.0);
-        if(angle_compensate_multiple < 1) 
-          angle_compensate_multiple = 1;
-        max_distance = current_scan_mode.max_distance;
-        ROS_INFO("current scan mode: %s, max_distance: %.1f m, Point number: %.1fK , angle_compensate: %d",  current_scan_mode.scan_mode,
-                 current_scan_mode.max_distance, (1000/current_scan_mode.us_per_sample), angle_compensate_multiple);
-    }
-    else
-    {
-        ROS_ERROR("Can not start scan: %08x!", op_result);
-    }
+    } while(!ok);
 
     ros::Time start_scan_time;
     ros::Time end_scan_time;
